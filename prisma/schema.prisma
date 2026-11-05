@@ -1,0 +1,286 @@
+// 모퉁이 공유오피스 관리 시스템 — Prisma 스키마
+// ERD(01_요구사항정의서.md / 02_기능정의서.md / diagram)와 1:1 대응
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum MemberType {
+  INDIVIDUAL // 개인
+  COMPANY // 법인
+}
+
+enum MemberStatus {
+  ACTIVE // 활성
+  TERMINATED // 해지
+}
+
+enum CustomerAccountRole {
+  SUPER_ADMIN // 최고관리자 (법인에서만 의미) — 전체 권한
+  PERMISSION_ADMIN // 권한관리자 (법인에서만 의미) — 일반사용자 계정만 관리 가능
+  MEMBER_USER // 일반사용자
+}
+
+enum CustomerAccountStatus {
+  ACTIVE // 재직
+  INACTIVE // 비활성(퇴사)
+}
+
+enum ReservationStatus {
+  BOOKED // 예약됨
+  CANCELLED // 취소
+}
+
+enum StaffPosition {
+  CEO // 대표
+  PERMISSION_ADMIN // 권한관리자 (인사/총무 + 구 임원)
+  GENERAL_ADMIN // 일반관리자
+}
+
+enum StaffStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum MaintenanceStatus {
+  IN_PROGRESS // 점검중
+  COMPLETED // 완료
+}
+
+enum ReportStatus {
+  RECEIVED // 접수
+  IN_PROGRESS // 처리중
+  COMPLETED // 완료
+}
+
+enum MembershipTypeCode {
+  FREE_SEAT // 자유석 — 일반석 구역, 전용 공간 없음(고정석이 아닌 나머지를 오픈으로 사용)
+  FIXED_SEAT // 고정석 — 일반석 구역, 전용 자리 배정
+  OFFICE // 오피스 — 별도 오피스 구역, 전용 호실 배정
+}
+
+enum SpaceType {
+  SEAT // 일반석 구역의 고정 자리
+  OFFICE // 오피스 구역의 전용 호실
+}
+
+// ---------------------------------------------------------------------------
+// 멤버십
+// ---------------------------------------------------------------------------
+
+model MembershipType {
+  id                String              @id @default(cuid())
+  code              MembershipTypeCode  @unique // 공간 배정 검증에 쓰는 고정 코드 (이름은 바뀌어도 코드는 안정적으로 유지)
+  name              String // 자유석 / 고정석 / 오피스
+  monthlyFee        Int // 월요금 (원) — 공간(자유석/고정석/오피스) 이용료
+  monthlyUsageHours Int // 월이용한도시간 — 그 공간 멤버십에 "추가로" 딸려오는 회의실 이용 혜택
+  histories         MembershipHistory[]
+
+  @@map("membership_types")
+}
+
+model MembershipHistory {
+  id               String   @id @default(cuid())
+  memberId         String
+  member           Member   @relation(fields: [memberId], references: [id])
+  membershipTypeId String
+  membershipType   MembershipType @relation(fields: [membershipTypeId], references: [id])
+  startDate        DateTime @db.Date
+  endDate          DateTime @db.Date
+  createdAt        DateTime @default(now())
+
+  @@index([memberId])
+  @@map("membership_histories")
+}
+
+// ---------------------------------------------------------------------------
+// 멤버 / 고객계정
+// ---------------------------------------------------------------------------
+
+model Member {
+  id                  String       @id @default(cuid())
+  type                MemberType
+  companyName         String? // 법인명 (법인인 경우만)
+  overageAllowedHours Int          @default(0) // 초과허용시간 (셀프서비스 설정)
+  status              MemberStatus @default(ACTIVE)
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  accounts            CustomerAccount[]
+  membershipHistories MembershipHistory[]
+  spaceAssignments    SpaceAssignment[]
+  reservations        Reservation[]
+
+  @@map("members")
+}
+
+model CustomerAccount {
+  id            String                 @id @default(cuid())
+  email         String                 @unique
+  passwordHash  String
+  name          String
+  memberId      String
+  member        Member                 @relation(fields: [memberId], references: [id])
+  role          CustomerAccountRole    @default(MEMBER_USER)
+  status        CustomerAccountStatus  @default(ACTIVE)
+  deactivatedAt DateTime?
+  createdAt     DateTime               @default(now())
+
+  reservations Reservation[]
+  issueReports IssueReport[]
+
+  @@index([memberId])
+  @@map("customer_accounts")
+}
+
+// 전용공간배정 — 일반석 구역의 고정석(SEAT)과 오피스 구역의 호실(OFFICE)을 함께 관리한다.
+// 자유석은 "고정석이 아닌 나머지 일반석"을 오픈으로 쓰는 개념이라 별도 배정 레코드가 없다.
+model SpaceAssignment {
+  id          String    @id @default(cuid())
+  spaceType   SpaceType // SEAT(고정석) | OFFICE(오피스)
+  spaceNumber String // 자리번호(예: A-12) 또는 호실번호(예: 301호)
+  memberId    String
+  member      Member    @relation(fields: [memberId], references: [id])
+  startDate   DateTime  @db.Date
+  endDate     DateTime  @db.Date
+
+  @@index([memberId])
+  @@map("space_assignments")
+}
+
+// 가상의 건물 구조도 — 실제로 존재하는 고정석/오피스 자리 목록(마스터 데이터). 고객 셀프서비스 선택 UI의 기준이 된다
+model BuildingSpace {
+  id          String    @id @default(cuid())
+  spaceType   SpaceType // SEAT(고정석) | OFFICE(오피스)
+  spaceNumber String    @unique // 자리번호(예: A-12) 또는 호실번호(예: 301호)
+  floor       Int
+  zone        String // 구역 라벨(예: "2층 일반석 구역", "3층 오피스 구역")
+
+  @@map("building_spaces")
+}
+
+// ---------------------------------------------------------------------------
+// 회의실 / 장비 / 예약
+// ---------------------------------------------------------------------------
+
+model MeetingRoom {
+  id                      String  @id @default(cuid())
+  name                    String
+  capacity                Int
+  maintenanceIntervalDays Int? // 정기점검주기 (일, nullable)
+  floor                   Int     @default(1) // 회의실 위치 안내용 — 몇 층에 있는지
+  zone                    String  @default("1층") // 회의실 위치 안내용 — 층 내 구역 라벨(예: "1층 서쪽")
+
+  equipmentLinks RoomEquipment[]
+  reservations   Reservation[]
+  maintenances   RoomMaintenance[]
+  issueReports   IssueReport[]
+
+  @@map("meeting_rooms")
+}
+
+model EquipmentType {
+  id   String @id @default(cuid())
+  name String // 화상회의 / 화이트보드 등
+
+  roomLinks RoomEquipment[]
+
+  @@map("equipment_types")
+}
+
+model RoomEquipment {
+  roomId          String
+  room            MeetingRoom   @relation(fields: [roomId], references: [id])
+  equipmentTypeId String
+  equipmentType   EquipmentType @relation(fields: [equipmentTypeId], references: [id])
+
+  @@id([roomId, equipmentTypeId])
+  @@map("room_equipment")
+}
+
+model Reservation {
+  id            String             @id @default(cuid())
+  roomId        String
+  room          MeetingRoom        @relation(fields: [roomId], references: [id])
+  accountId     String
+  account       CustomerAccount    @relation(fields: [accountId], references: [id])
+  memberId      String
+  member        Member             @relation(fields: [memberId], references: [id])
+  startAt       DateTime // 시작시각
+  endAt         DateTime // 종료시각
+  attendeeCount Int
+  status        ReservationStatus  @default(BOOKED)
+  noRefundCancel Boolean           @default(false) // 시작 1시간 이내 취소 — 쿼터 환원 없이 "이용한 것"으로 집계
+  createdAt     DateTime           @default(now())
+
+  @@index([roomId, startAt, endAt])
+  @@index([memberId])
+  @@index([accountId])
+  @@map("reservations")
+}
+
+// ---------------------------------------------------------------------------
+// 운영측 직원
+// ---------------------------------------------------------------------------
+
+model Staff {
+  id                 String        @id @default(cuid())
+  email              String        @unique
+  passwordHash       String
+  name               String
+  position           StaffPosition
+  team               String? // 소속팀 (표시용 라벨, 권한 무관)
+  status             StaffStatus   @default(ACTIVE)
+  mustChangePassword Boolean       @default(false)
+  createdAt          DateTime      @default(now())
+
+  registeredMaintenances RoomMaintenance[]
+
+  @@map("staff")
+}
+
+// ---------------------------------------------------------------------------
+// 시설 운영 (점검 / 고장 제보)
+// ---------------------------------------------------------------------------
+
+model RoomMaintenance {
+  id      String             @id @default(cuid())
+  roomId  String
+  room    MeetingRoom        @relation(fields: [roomId], references: [id])
+  staffId String
+  staff   Staff              @relation(fields: [staffId], references: [id])
+  reason  String // 고장/점검 사유
+  startAt DateTime
+  endAt   DateTime?
+  status  MaintenanceStatus  @default(IN_PROGRESS)
+  resolutionNotes String? // 완료 처리 시 "무엇을 어떻게 고쳤는지" 기록(선택)
+
+  issueReports IssueReport[]
+
+  @@index([roomId, startAt, endAt])
+  @@map("room_maintenances")
+}
+
+model IssueReport {
+  id            String           @id @default(cuid())
+  roomId        String
+  room          MeetingRoom      @relation(fields: [roomId], references: [id])
+  accountId     String
+  account       CustomerAccount  @relation(fields: [accountId], references: [id])
+  maintenanceId String?
+  maintenance   RoomMaintenance? @relation(fields: [maintenanceId], references: [id])
+  content       String
+  reportedAt    DateTime         @default(now())
+  status        ReportStatus     @default(RECEIVED)
+
+  @@map("issue_reports")
+}
